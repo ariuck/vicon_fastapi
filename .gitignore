@@ -1,0 +1,7 @@
+# Python 가상환경 / 캐시
+.venv/
+__pycache__/
+*.pyc
+
+# 브라우저에서 추출해 서버에 저장되는 JSON 결과
+output/

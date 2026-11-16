@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VICON Three.js Viewer (FastAPI)</title>
+
+  <style>
+    body {
+      margin: 0;
+      background: #202530;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+
+    #toolbar {
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 10px 18px;
+      cursor: pointer;
+    }
+
+    select {
+      padding: 9px 10px;
+      font-size: 14px;
+      max-width: 100%;
+    }
+
+    #viewer {
+      width: 100%;
+      height: calc(100vh - 80px);
+      min-height: 350px;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="toolbar">
+    <strong>VICON 동작 재생 (FastAPI)</strong>
+    <button id="prev" title="이전 파일">◀</button>
+    <select id="glbSelect"></select>
+    <button id="next" title="다음 파일">▶</button>
+    <button id="download" disabled>3D JSON 추출</button>
+    <span id="status">GLB 로딩 중...</span>
+  </div>
+
+  <div id="viewer"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from
+      "three/addons/loaders/GLTFLoader.js";
+    import { OrbitControls } from
+      "three/addons/controls/OrbitControls.js";
+
+    // ----------------------------------
+    // 1. GLB 파일 설정 (assets 폴더 목록에서 선택)
+    // ----------------------------------
+
+    let FILE_NAME = "";   // 확장자 없는 이름, 예: 261111_D001_T001_LHY
+    const FPS = 30;
+
+    const viewer = document.getElementById("viewer");
+    const status = document.getElementById("status");
+    const downloadBtn = document.getElementById("download");
+    const glbSelect = document.getElementById("glbSelect");
+    const prevBtn = document.getElementById("prev");
+    const nextBtn = document.getElementById("next");
+
+    // ----------------------------------
+    // 2. Three.js 화면 생성
+    // ----------------------------------
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202530);
+
+    const camera = new THREE.PerspectiveCamera(
+      50,
+      viewer.clientWidth / viewer.clientHeight,
+      0.001,
+      1000
+    );
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true
+    });
+
+    renderer.setSize(
+      viewer.clientWidth,
+      viewer.clientHeight
+    );
+
+    renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio, 2)
+    );
+
+    viewer.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(
+      0xffffff, 0x444444, 2
+    ));
+
+    const light = new THREE.DirectionalLight(
+      0xffffff, 2
+    );
+
+    light.position.set(5, 10, 5);
+    scene.add(light);
+
+    const controls = new OrbitControls(
+      camera,
+      renderer.domElement
+    );
+
+    // ----------------------------------
+    // 3. GLB 불러오기
+    // ----------------------------------
+
+    let mixer = null;
+    let clip = null;
+    let model = null;
+    const bones = [];
+    let loadToken = 0;   // 빠르게 파일을 바꿀 때 이전 로딩 결과 무시용
+
+    // 이전에 띄운 모델을 화면과 메모리에서 제거
+    function unloadModel() {
+      if (mixer) {
+        mixer.stopAllAction();
+        mixer = null;
+      }
+
+      if (model) {
+        scene.remove(model);
+        model.traverse(object => {
+          if (object.geometry) {
+            object.geometry.dispose();
+          }
+          const materials = Array.isArray(object.material)
+            ? object.material
+            : object.material ? [object.material] : [];
+          materials.forEach(material => {
+            Object.values(material).forEach(value => {
+              if (value && value.isTexture) value.dispose();
+            });
+            material.dispose();
+          });
+        });
+        model = null;
+      }
+
+      clip = null;
+      bones.length = 0;
+    }
+
+    async function loadModel(fileName) {
+      const token = ++loadToken;
+
+      unloadModel();
+      FILE_NAME = fileName.replace(/\.glb$/i, "");
+      downloadBtn.disabled = true;
+      status.textContent = `${FILE_NAME}.glb 로딩 중...`;
+
+      try {
+        const gltf = await new GLTFLoader()
+          .loadAsync(`/assets/${encodeURIComponent(FILE_NAME)}.glb`);
+
+        // 로딩 중에 다른 파일을 선택했다면 이 결과는 버림
+        if (token !== loadToken) {
+          return;
+        }
+
+        model = gltf.scene;
+        scene.add(model);
+
+        clip = gltf.animations[0];
+
+        if (!clip) {
+          throw new Error(
+            "GLB에 애니메이션이 없습니다."
+          );
+        }
+
+        model.traverse(object => {
+          if (object.isBone) {
+            bones.push(object);
+          }
+        });
+
+        if (bones.length === 0) {
+          throw new Error(
+            "GLB에 Bone이 없습니다."
+          );
+        }
+
+        mixer = new THREE.AnimationMixer(model);
+        mixer.clipAction(clip).play();
+        mixer.setTime(0);
+
+        model.updateMatrixWorld(true);
+
+        // 모델 크기에 맞춰 카메라 위치 설정
+        const box = new THREE.Box3()
+          .setFromObject(model);
+
+        const center = box.getCenter(
+          new THREE.Vector3()
+        );
+
+        const size = box.getSize(
+          new THREE.Vector3()
+        );
+
+        const distance = Math.max(
+          size.x, size.y, size.z, 1
+        );
+
+        camera.position.set(
+          center.x + distance,
+          center.y + distance * 0.5,
+          center.z + distance * 2
+        );
+
+        controls.target.copy(center);
+        controls.update();
+
+        status.textContent =
+          `${FILE_NAME} | 재생 중 | ${clip.duration.toFixed(2)}초` +
+          ` | Bone ${bones.length}개`;
+
+        downloadBtn.disabled = false;
+
+      } catch (error) {
+        if (token !== loadToken) {
+          return;
+        }
+        console.error(error);
+        unloadModel();
+        status.textContent =
+          `오류 (${FILE_NAME}.glb): ` + error.message;
+      }
+    }
+
+    // assets 폴더 GLB 목록을 서버에서 받아 선택 상자 채우기
+    async function loadFileList() {
+      try {
+        const response = await fetch("/api/assets");
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const { files } = await response.json();
+
+        if (files.length === 0) {
+          status.textContent = "assets 폴더에 .glb 파일이 없습니다.";
+          return;
+        }
+
+        glbSelect.innerHTML = "";
+        files.forEach((name, i) => {
+          const option = document.createElement("option");
+          option.value = name;
+          option.textContent = `${i + 1}. ${name}`;
+          glbSelect.appendChild(option);
+        });
+
+        loadModel(glbSelect.value);
+
+      } catch (error) {
+        console.error(error);
+        status.textContent = "GLB 목록 불러오기 오류: " + error.message;
+      }
+    }
+
+    function selectByOffset(offset) {
+      const count = glbSelect.options.length;
+      if (count === 0) return;
+      glbSelect.selectedIndex =
+        (glbSelect.selectedIndex + offset + count) % count;
+      loadModel(glbSelect.value);
+    }
+
+    glbSelect.addEventListener("change", () => loadModel(glbSelect.value));
+    prevBtn.addEventListener("click", () => selectByOffset(-1));
+    nextBtn.addEventListener("click", () => selectByOffset(1));
+
+    // ----------------------------------
+    // 4. GLB 애니메이션 재생
+    // ----------------------------------
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+
+      if (mixer) {
+        mixer.update(delta);
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // ----------------------------------
+    // 5. 3D JSON 추출
+    // ----------------------------------
+
+    async function extractJSON() {
+      if (!mixer || !clip || !model) {
+        return;
+      }
+
+      downloadBtn.disabled = true;
+      // 추출하는 동안에는 파일을 바꾸지 못하게 잠금
+      glbSelect.disabled = prevBtn.disabled = nextBtn.disabled = true;
+      status.textContent = "3D JSON 추출 중...";
+
+      const previousTime = mixer.time;
+
+      const totalFrames = Math.ceil(
+        clip.duration * FPS
+      );
+
+      const position = new THREE.Vector3();
+      const frames = [];
+
+      try {
+        for (let i = 0; i < totalFrames; i++) {
+          const time = i / FPS;
+
+          // 해당 시간의 애니메이션 적용
+          mixer.setTime(time);
+          model.updateMatrixWorld(true);
+
+          // 모든 Bone의 3D 좌표 추출
+          const joints = bones.map(bone => {
+            bone.getWorldPosition(position);
+
+            return {
+              name: bone.name,
+              x: Number(position.x.toFixed(6)),
+              y: Number(position.y.toFixed(6)),
+              z: Number(position.z.toFixed(6))
+            };
+          });
+
+          frames.push({
+            frame: i,
+            time_sec: Number(time.toFixed(6)),
+            joints
+          });
+        }
+
+        // 기존 재생 시간 복원
+        mixer.setTime(previousTime);
+        model.updateMatrixWorld(true);
+
+        // JSON 데이터 구성
+        const result = {
+          source_glb: `${FILE_NAME}.glb`,
+          animation: clip.name,
+          fps: FPS,
+          duration_sec: clip.duration,
+          coordinate_system: "Three.js world Y-up",
+          unit: "meter (glTF standard)",
+          bone_count: bones.length,
+          frame_count: frames.length,
+          frames
+        };
+
+        const jsonText = JSON.stringify(
+          result, null, 2
+        );
+
+        // ----------------------------------
+        // 6. FastAPI 서버에 JSON 저장
+        // ----------------------------------
+
+        let serverSaved = false;
+
+        try {
+          const response = await fetch(
+            "/api/save-json",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: jsonText
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(
+              `HTTP ${response.status}`
+            );
+          }
+
+          serverSaved = true;
+
+        } catch (error) {
+          console.error(
+            "FastAPI JSON 저장 오류:", error
+          );
+        }
+
+        // ----------------------------------
+        // 7. 브라우저 JSON 다운로드
+        // ----------------------------------
+
+        const blob = new Blob(
+          [jsonText],
+          { type: "application/json" }
+        );
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+
+        link.href = url;
+        link.download = `${FILE_NAME}_3d.json`;
+
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+        }, 1000);
+
+        status.textContent =
+          `${frames.length}프레임 / ` +
+          `Bone ${bones.length}개 | ` +
+          (
+            serverSaved
+              ? "FastAPI 저장 + 다운로드 완료"
+              : "다운로드 완료 (서버 저장 실패)"
+          );
+
+      } catch (error) {
+        console.error(error);
+        status.textContent =
+          "추출 오류: " + error.message;
+
+      } finally {
+        mixer.setTime(previousTime);
+        model.updateMatrixWorld(true);
+        downloadBtn.disabled = false;
+        glbSelect.disabled = prevBtn.disabled = nextBtn.disabled = false;
+      }
+    }
+
+    downloadBtn.addEventListener(
+      "click", extractJSON
+    );
+
+    // ----------------------------------
+    // 8. 브라우저 크기 변경 처리
+    // ----------------------------------
+
+    window.addEventListener("resize", () => {
+      camera.aspect =
+        viewer.clientWidth / viewer.clientHeight;
+
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(
+        viewer.clientWidth,
+        viewer.clientHeight
+      );
+    });
+
+    loadFileList();
+    animate();
+  </script>
+</body>
+</html>
